@@ -19,6 +19,7 @@ info()    { log "${CYAN}INFO${NC}  $*"; }
 warn()    { log "${YELLOW}WARN${NC}  $*"; }
 success() { log "${GREEN}OK${NC}    $*"; }
 error()   { log "${RED}ERROR${NC} $*"; }
+debug()   { [[ "$DEBUG" == "true" ]] && log "${BOLD}DEBUG${NC} $*" || true; }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 PARALLEL_WORKERS=32
@@ -26,6 +27,7 @@ FILES_PER_BATCH=500
 MAX_DELETES_PER_SEC=0
 DRY_RUN=false
 SKIP_CONFIRM=false
+DEBUG=false
 LOG_FILE="/tmp/efs_delete_$(date +%Y%m%d_%H%M%S).log"
 
 usage() {
@@ -40,6 +42,7 @@ ${BOLD}Options:${NC}
   -n       Dry run — preview only, no deletion
   -y       Skip confirmation prompt (for scripts/tmux)
   -l <f>   Log file path             (default: /tmp/efs_delete_<timestamp>.log)
+  -d       Debug mode — verbose logging at each step
   -h       Show this help
 
 ${BOLD}Rate limit guidance:${NC}
@@ -65,7 +68,7 @@ EOF
 }
 
 # ── Parse CLI args ─────────────────────────────────────────────────────────────
-while getopts ":w:b:r:l:nyh" opt; do
+while getopts ":w:b:r:l:nydh" opt; do
   case $opt in
     w) PARALLEL_WORKERS="$OPTARG" ;;
     b) FILES_PER_BATCH="$OPTARG" ;;
@@ -73,6 +76,7 @@ while getopts ":w:b:r:l:nyh" opt; do
     l) LOG_FILE="$OPTARG" ;;
     n) DRY_RUN=true ;;
     y) SKIP_CONFIRM=true ;;
+    d) DEBUG=true ;;
     h) usage ;;
     :) echo "Option -$OPTARG requires an argument."; exit 1 ;;
     \?) echo "Unknown option: -$OPTARG"; exit 1 ;;
@@ -84,6 +88,8 @@ TARGET="${1:-}"
 
 # ── Preflight ──────────────────────────────────────────────────────────────────
 preflight() {
+  debug "preflight: TARGET='$TARGET'"
+
   if [[ -z "$TARGET" ]]; then
     error "No target directory specified. Use -h for help."
     exit 1
@@ -91,8 +97,11 @@ preflight() {
 
   if [[ ! -d "$TARGET" ]]; then
     error "Target directory does not exist: $TARGET"
+    debug "preflight: ls of parent: $(ls -la "$(dirname "$TARGET")" 2>&1 || true)"
     exit 1
   fi
+  debug "preflight: target exists and is a directory"
+  debug "preflight: target permissions: $(ls -lad "$TARGET" 2>&1 || true)"
 
   # Validate numeric args
   if ! [[ "$PARALLEL_WORKERS" =~ ^[0-9]+$ ]] || (( PARALLEL_WORKERS < 1 || PARALLEL_WORKERS > 256 )); then
@@ -108,6 +117,7 @@ preflight() {
   # e.g. /opt/shared/filecache/ -> /opt/shared/filecache
   local resolved
   resolved=$(realpath "$TARGET")
+  debug "preflight: resolved path = '$resolved'"
 
   # System paths: block exact match AND any subdirectory
   local SYSTEM_FORBIDDEN=("/" "/etc" "/usr" "/var" "/home" "/root" "/proc" "/sys" "/dev" "/boot" "/tmp")
@@ -136,30 +146,53 @@ preflight() {
       error "Required command not found: $cmd"
       exit 1
     fi
+    debug "preflight: found tool '$cmd' at $(command -v "$cmd")"
   done
 
   # Check for GNU parallel (optional)
   if command -v parallel &>/dev/null; then
     HAVE_PARALLEL=true
+    debug "preflight: GNU parallel found at $(command -v parallel)"
   else
     HAVE_PARALLEL=false
     warn "GNU parallel not found — falling back to find+xargs (still fast)"
   fi
+
+  # Check mount type - helpful for diagnosing NFS vs EFS vs local behaviour
+  local mount_info
+  mount_info=$(df -T "$TARGET" 2>/dev/null || echo "df failed")
+  debug "preflight: mount info: $mount_info"
+
+  # Log first-level contents so we know what we are about to delete
+  debug "preflight: top-level contents of target:"
+  debug "$(ls -la "$TARGET" 2>&1 | head -20 || true)"
+  info "preflight: all checks passed"
 }
 
 # ── Estimate scope ─────────────────────────────────────────────────────────────
 estimate_scope() {
   info "Estimating file count (sampling up to 100k files)..."
+  debug "estimate_scope: running find on '$TARGET'"
   local sample_count
-  sample_count=$(find "$TARGET" -mindepth 1 -type f 2>/dev/null | head -100000 | wc -l)
-  if (( sample_count >= 100000 )); then
+  # Note: find|head intentionally triggers SIGPIPE when head exits early.
+  # We use || true to prevent set -o pipefail from killing the script.
+  sample_count=$(find "$TARGET" -mindepth 1 -type f 2>/dev/null | head -100000 | wc -l || true)
+  sample_count="${sample_count//[[:space:]]/}"   # trim whitespace
+  debug "estimate_scope: raw sample_count='$sample_count'"
+  if [[ -z "$sample_count" ]]; then
+    warn "Could not estimate file count (permission error or empty dir)"
+    debug "estimate_scope: find test exit code: $(find "$TARGET" -mindepth 1 -type f -maxdepth 1 2>&1 | head -5 || true)"
+    sample_count=0
+  elif (( sample_count >= 100000 )); then
     warn "100,000+ files found — actual count is much larger"
   else
     info "Estimated file count: $sample_count"
   fi
   local disk_usage
   disk_usage=$(du -sh "$TARGET" 2>/dev/null | cut -f1 || echo "unknown")
+  debug "estimate_scope: du exit code=$? disk_usage='$disk_usage'"
   info "Approximate disk usage: $disk_usage"
+  debug "estimate_scope: done"
 }
 
 # ── Progress monitor (background) ─────────────────────────────────────────────
@@ -173,7 +206,8 @@ start_progress_monitor() {
       local fmt
       fmt=$(printf '%02d:%02d:%02d' $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)))
       local remaining
-      remaining=$(find "$TARGET" -mindepth 1 -type f 2>/dev/null | head -10000 | wc -l || echo "?")
+      remaining=$(find "$TARGET" -mindepth 1 -type f 2>/dev/null | head -10000 | wc -l 2>/dev/null || echo "?")
+      remaining="${remaining//[[:space:]]/}"
       log "${CYAN}PROGRESS${NC} Elapsed: ${fmt} | Files remaining (sample): ${remaining}+"
     done
   ) &
@@ -238,7 +272,8 @@ run_delete() {
     info "Sample of contents that would be deleted:"
     find "$TARGET" -mindepth 1 2>/dev/null | head -20
     local count
-    count=$(find "$TARGET" -mindepth 1 -type f 2>/dev/null | wc -l)
+    count=$(find "$TARGET" -mindepth 1 -type f 2>/dev/null | wc -l || true)
+    count="${count//[[:space:]]/}"
     info "Total files that would be deleted: $count"
     return
   fi
@@ -266,14 +301,16 @@ run_delete() {
 
   else
     info "xargs mode: $PARALLEL_WORKERS workers, unlimited rate"
-    find "$TARGET" -mindepth 1 -type f -print0 2>/dev/null \
-      | xargs -0 -P "$PARALLEL_WORKERS" -n "$FILES_PER_BATCH" rm -f \
-      || warn "Some deletions had errors"
+    debug "run_delete: xargs command: find '$TARGET' -mindepth 1 -type f -print0 | xargs -0 -P $PARALLEL_WORKERS -n $FILES_PER_BATCH rm -f"
+    find "$TARGET" -mindepth 1 -type f -print0 2>/dev/null       | xargs -0 -P "$PARALLEL_WORKERS" -n "$FILES_PER_BATCH" rm -f       || warn "Some deletions had errors"
+    debug "run_delete: xargs phase complete, exit code: $?"
   fi
 
   # Phase 2: remove empty subdirectories (never removes TARGET itself)
   info "Phase 2/2: Removing empty subdirectories (root preserved)"
+  debug "run_delete: starting empty dir removal"
   find "$TARGET" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
+  debug "run_delete: empty dir removal complete"
 
   cleanup_rate_limiter
 
@@ -282,8 +319,10 @@ run_delete() {
   fmt=$(printf '%02d:%02d:%02d' $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)))
   success "Deletion finished in ${fmt}"
 
+  debug "run_delete: verifying root dir still exists: $TARGET"
   if [[ -d "$TARGET" ]]; then
     success "Root directory preserved: $TARGET"
+    debug "run_delete: final state of target: $(ls -la "$TARGET" 2>&1 | head -10 || true)"
   else
     error "Root directory missing — this should not happen!"
     exit 1
@@ -300,8 +339,15 @@ main() {
   info "  Workers  : $PARALLEL_WORKERS | Batch: $FILES_PER_BATCH"
   info "  Rate cap : ${MAX_DELETES_PER_SEC} deletions/sec (0=unlimited)"
   info "  Dry run  : $DRY_RUN"
+  info "  Debug    : $DEBUG"
   info "  Log      : $LOG_FILE"
   info "═══════════════════════════════════════════════════"
+  [[ "$DEBUG" == "true" ]] && warn "Debug mode ON — verbose output enabled"
+  debug "Shell: $BASH_VERSION | PID: $$"
+  debug "PATH: $PATH"
+  debug "User: $(id)"
+  debug "Hostname: $(hostname)"
+  debug "Working dir: $(pwd)"
 
   estimate_scope
 
