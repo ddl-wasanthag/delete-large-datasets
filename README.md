@@ -12,6 +12,7 @@ Production-safe parallel file deletion for large EFS mounts. Empties a directory
 - **CLI flags only** — environment variables are never used, no risk of env conflicts (e.g. a pre-existing `DRY_RUN=false` in your shell will not interfere)
 - **Protected path guard** — refuses to run against system or protected mount paths
 - **Two-phase cleanup** — files first, then empty subdirectories bottom-up
+- **Debug mode** — `-d` flag emits verbose diagnostics at every stage for troubleshooting
 
 ---
 
@@ -45,6 +46,7 @@ Production-safe parallel file deletion for large EFS mounts. Empties a directory
 | `-r <N>` | `0` | Max deletions per second across all workers. `0` = unlimited. |
 | `-n` | off | Dry run — preview only, no files deleted. |
 | `-y` | off | Skip the interactive `YES` confirmation prompt. |
+| `-d` | off | Debug mode — verbose logging at every stage. See [Troubleshooting](#troubleshooting). |
 | `-l <path>` | auto | Log file path. Defaults to `/tmp/efs_delete_<timestamp>.log`. |
 | `-h` | | Print help and exit. |
 
@@ -116,4 +118,50 @@ The script refuses to run if the target resolves to a protected path. Trailing s
 **App-protected paths (exact match blocked, subdirectories allowed):**
 ```
 /mnt  /opt  /opt/shared  /opt/shared/filecache
+```
+
+---
+
+## Troubleshooting
+
+### Enable debug mode
+
+Add `-d` to any command to get verbose output at every stage:
+
+```bash
+./efs_bulk_delete.sh -n -d /opt/shared/filecache/dataset1
+```
+
+### What `-d` logs at each stage
+
+| Stage | What gets logged |
+|-------|-----------------|
+| **startup** | Bash version, PID, `PATH`, user (`id`), hostname, working directory |
+| **preflight** | Raw target string, resolved path, permissions, each required tool and its path, mount type (`df -T`), top 20 entries of target dir |
+| **estimate_scope** | Raw `find` output before trimming, `du` exit code, fallback find test if count is empty |
+| **run_delete** | Exact `xargs` command, exit code after each phase, final `ls` of target after deletion |
+
+### Common failure: script exits silently after "Estimating file count"
+
+**Cause:** `set -o pipefail` combined with `find | head` — when `head` exits after reading enough lines it closes the pipe, sending `SIGPIPE` to `find`, which exits non-zero and kills the whole script.
+
+This is especially common on EFS mounts where `find` is slower than local disk.
+
+**Fix:** Already handled in the script via `|| true` on all `find | head | wc` pipelines. If you still see this, run with `-d` and check the last DEBUG line before the exit to identify which pipeline is failing.
+
+### Common failure: script exits silently, no error message
+
+Likely causes in order of probability:
+
+1. **Environment variable conflict** — check for `DRY_RUN`, `PARALLEL_WORKERS`, or similar vars in your shell: `env | grep -iE 'dry|worker|delete|rate'`. These are ignored by the script but worth ruling out.
+2. **Permission denied on target** — run with `-d` and look for the `preflight: target permissions` line.
+3. **`realpath` not available** — run with `-d` and check the `preflight: found tool` lines.
+4. **EFS stale file handle** — if the mount has connectivity issues, `find` may return non-zero. The `-d` output will show the `estimate_scope: raw sample_count` value — if it is empty, the mount is likely the issue.
+
+### Capturing a full debug log
+
+The script writes a full log to `/tmp/efs_delete_<timestamp>.log`. To capture everything including debug output to a single file:
+
+```bash
+./efs_bulk_delete.sh -d -n /opt/shared/filecache/dataset1 2>&1 | tee /tmp/debug_run.log
 ```
